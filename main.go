@@ -90,6 +90,16 @@ func main() {
 			}
 		}},
 		{id: 51, mod: MOD_ALT | MOD_WIN, vk: w32.VK_BACK, callback: func() { cycleEdgeFuncs(4) }},
+		{id: 52, mod: MOD_ALT | MOD_WIN, vk: w32.VK_DELETE, callback: func() {
+			hwnd := w32.GetForegroundWindow()
+			if hwnd == 0 {
+				panic("foreground window is NULL")
+			}
+			if _, err := moveToNextMonitor(hwnd); err != nil {
+				fmt.Printf("warn: maximize: %v\n", err)
+				return
+			}
+		}},
 	}
 
 	var failedHotKeys []HotKey
@@ -128,8 +138,97 @@ func main() {
 func showMessageBox(text string) {
 	w32.MessageBox(w32.GetActiveWindow(), text, "RectangleWin", w32.MB_ICONWARNING|w32.MB_OK)
 }
+func modNeg(v, m int) int {
+	return (v%m + m) % m
+}
+func moveToNextMonitor(hwnd w32.HWND) (bool, error) {
+	if !isZonableWindow(hwnd) {
+		fmt.Printf("warn: non-zonable window: %s\n", w32.GetWindowText(hwnd))
+		return false, nil
+	}
+	rect := w32.GetWindowRect(hwnd)
+	mon := w32.MonitorFromWindow(hwnd, w32.MONITOR_DEFAULTTONEAREST)
+	hdc := w32.GetDC(hwnd)
+	displayDPI := w32.GetDeviceCaps(hdc, w32.LOGPIXELSY)
+
+	var monitors []w32.HMONITOR
+	monitorIndex := 0
+	curMonitorIndex := 0
+
+	EnumMonitors(func(d w32.HMONITOR) bool {
+		monitors = append(monitors, d)
+		if d == mon {
+			monitorIndex = curMonitorIndex
+		}
+		curMonitorIndex += 1
+		return true
+	})
+
+	// move to monitor_index + 1
+	mon = monitors[modNeg(monitorIndex-1, len(monitors))]
+
+	if !w32.ReleaseDC(hwnd, hdc) {
+		return false, fmt.Errorf("failed to ReleaseDC:%d", w32.GetLastError())
+	}
+	var monInfo w32.MONITORINFO
+	if !w32.GetMonitorInfo(mon, &monInfo) {
+		return false, fmt.Errorf("failed to GetMonitorInfo:%d", w32.GetLastError())
+	}
+
+	ok, frame := w32.DwmGetWindowAttributeEXTENDED_FRAME_BOUNDS(hwnd)
+	if !ok {
+		return false, fmt.Errorf("failed to DwmGetWindowAttributeEXTENDED_FRAME_BOUNDS:%d", w32.GetLastError())
+	}
+	windowDPI := w32ex.GetDpiForWindow(hwnd)
+	resizedFrame := resizeForDpi(frame, int32(windowDPI), int32(displayDPI))
+
+	fmt.Printf("> window: 0x%x %#v (w:%d,h:%d) mon=0x%X(@ display DPI:%d)\n", hwnd, rect, rect.Width(), rect.Height(), mon, displayDPI)
+	fmt.Printf("> DWM frame:        %#v (W:%d,H:%d) @ window DPI=%v\n", frame, frame.Width(), frame.Height(), windowDPI)
+	fmt.Printf("> DPI-less frame:   %#v (W:%d,H:%d)\n", resizedFrame, resizedFrame.Width(), resizedFrame.Height())
+
+	// calculate how many extra pixels go to win10 invisible borders
+	lExtra := resizedFrame.Left - rect.Left
+	rExtra := -resizedFrame.Right + rect.Right
+	tExtra := resizedFrame.Top - rect.Top
+	bExtra := -resizedFrame.Bottom + rect.Bottom
+
+	newPos := center(monInfo.RcWork, resizedFrame)
+
+	// adjust offsets based on invisible borders
+	newPos.Left -= lExtra
+	newPos.Top -= tExtra
+	newPos.Right += rExtra
+	newPos.Bottom += bExtra
+
+	lastResized = hwnd
+	if sameRect(rect, &newPos) {
+		fmt.Println("no resize")
+		return false, nil
+	}
+
+	fmt.Printf("> resizing to: %#v (W:%d,H:%d)\n", newPos, newPos.Width(), newPos.Height())
+	if !w32.ShowWindow(hwnd, w32.SW_SHOWNORMAL) { // normalize window first if it's set to SW_SHOWMAXIMIZE (and therefore stays maximized)
+		return false, fmt.Errorf("failed to normalize window ShowWindow:%d", w32.GetLastError())
+	}
+	if !w32.SetWindowPos(hwnd, 0, int(newPos.Left), int(newPos.Top), int(newPos.Width()), int(newPos.Height()), w32.SWP_NOZORDER|w32.SWP_NOACTIVATE) {
+		return false, fmt.Errorf("failed to SetWindowPos:%d", w32.GetLastError())
+	}
+	rect = w32.GetWindowRect(hwnd)
+	fmt.Printf("> post-resize: %#v(W:%d,H:%d)\n", rect, rect.Width(), rect.Height())
+	return true, nil
+}
 
 type resizeFunc func(disp, cur w32.RECT) w32.RECT
+
+func center(disp, cur w32.RECT) w32.RECT {
+	w := (disp.Width() - cur.Width()) / 2
+	h := (disp.Height() - cur.Height()) / 2
+	return w32.RECT{
+		Left:   disp.Left + w,
+		Right:  disp.Left + w + cur.Width(),
+		Top:    disp.Top + h,
+		Bottom: disp.Top + h + cur.Height()}
+}
 
 func resize(hwnd w32.HWND, f resizeFunc) (bool, error) {
 	if !isZonableWindow(hwnd) {
